@@ -129,7 +129,7 @@ struct redisCommand redisCommandTable[] = {
     {"append",appendCommand,3,"wm",0,NULL,1,1,1,0,0},
     {"strlen",strlenCommand,2,"rF",0,NULL,1,1,1,0,0},
     {"del",delCommand,-2,"w",0,NULL,1,-1,1,0,0},
-    {"exists",existsCommand,2,"rF",0,NULL,1,1,1,0,0},
+    {"exists",existsCommand,-2,"rF",0,NULL,1,-1,1,0,0},
     {"setbit",setbitCommand,4,"wm",0,NULL,1,1,1,0,0},
     {"getbit",getbitCommand,3,"rF",0,NULL,1,1,1,0,0},
     {"setrange",setrangeCommand,4,"wm",0,NULL,1,1,1,0,0},
@@ -261,7 +261,7 @@ struct redisCommand redisCommandTable[] = {
     {"cluster",clusterCommand,-2,"ar",0,NULL,0,0,0,0,0},
     {"restore",restoreCommand,-4,"wm",0,NULL,1,1,1,0,0},
     {"restore-asking",restoreCommand,-4,"wmk",0,NULL,1,1,1,0,0},
-    {"migrate",migrateCommand,-6,"w",0,NULL,0,0,0,0,0},
+    {"migrate",migrateCommand,-6,"w",0,migrateGetKeys,0,0,0,0,0},
     {"asking",askingCommand,1,"r",0,NULL,0,0,0,0,0},
     {"readonly",readonlyCommand,1,"rF",0,NULL,0,0,0,0,0},
     {"readwrite",readwriteCommand,1,"rF",0,NULL,0,0,0,0,0},
@@ -280,7 +280,7 @@ struct redisCommand redisCommandTable[] = {
     {"command",commandCommand,0,"rlt",0,NULL,0,0,0,0,0},
     {"pfselftest",pfselftestCommand,1,"r",0,NULL,0,0,0,0,0},
     {"pfadd",pfaddCommand,-2,"wmF",0,NULL,1,1,1,0,0},
-    {"pfcount",pfcountCommand,-2,"r",0,NULL,1,1,1,0,0},
+    {"pfcount",pfcountCommand,-2,"r",0,NULL,1,-1,1,0,0},
     {"pfmerge",pfmergeCommand,-2,"wm",0,NULL,1,-1,1,0,0},
     {"pfdebug",pfdebugCommand,-3,"w",0,NULL,0,0,0,0,0},
     {"latency",latencyCommand,-2,"arslt",0,NULL,0,0,0,0,0}
@@ -840,18 +840,22 @@ void activeExpireCycle(int type) {
                 if ((de = dictGetRandomKey(db->expires)) == NULL) break;
                 ttl = dictGetSignedIntegerVal(de)-now;
                 if (activeExpireCycleTryExpire(db,de,now)) expired++;
-                if (ttl < 0) ttl = 0;
-                ttl_sum += ttl;
-                ttl_samples++;
+                if (ttl > 0) {
+                    /* We want the average TTL of keys yet not expired. */
+                    ttl_sum += ttl;
+                    ttl_samples++;
+                }
             }
 
             /* Update the average TTL stats for this database. */
             if (ttl_samples) {
                 long long avg_ttl = ttl_sum/ttl_samples;
 
+                /* Do a simple running average with a few samples.
+                 * We just use the current estimate with a weight of 2%
+                 * and the previous estimate with a weight of 98%. */
                 if (db->avg_ttl == 0) db->avg_ttl = avg_ttl;
-                /* Smooth the value averaging with the previous one. */
-                db->avg_ttl = (db->avg_ttl+avg_ttl)/2;
+                db->avg_ttl = (db->avg_ttl/50)*49 + (avg_ttl/50);
             }
 
             /* We can't block forever here even if there are many keys to
@@ -902,9 +906,12 @@ long long getInstantaneousMetric(int metric) {
     return sum / REDIS_METRIC_SAMPLES;
 }
 
-/* Check for timeouts. Returns non-zero if the client was terminated */
-int clientsCronHandleTimeout(redisClient *c) {
-    time_t now = server.unixtime;
+/* Check for timeouts. Returns non-zero if the client was terminated.
+ * The function gets the current time in milliseconds as argument since
+ * it gets called multiple times in a loop, so calling gettimeofday() for
+ * each iteration would be costly without any actual gain. */
+int clientsCronHandleTimeout(redisClient *c, mstime_t now_ms) {
+    time_t now = now_ms/1000;
 
     if (server.maxidletime &&
         !(c->flags & REDIS_SLAVE) &&    /* no timeout for slaves */
@@ -920,11 +927,16 @@ int clientsCronHandleTimeout(redisClient *c) {
         /* Blocked OPS timeout is handled with milliseconds resolution.
          * However note that the actual resolution is limited by
          * server.hz. */
-        mstime_t now_ms = mstime();
 
         if (c->bpop.timeout != 0 && c->bpop.timeout < now_ms) {
+            /* Handle blocking operation specific timeout. */
             replyToBlockedClientTimedOut(c);
             unblockClient(c);
+        } else if (server.cluster_enabled) {
+            /* Cluster: handle unblock & redirect of clients blocked
+             * into keys no longer served by this server. */
+            if (clusterRedirectBlockedClientIfNeeded(c))
+                unblockClient(c);
         }
     }
     return 0;
@@ -956,17 +968,23 @@ int clientsCronResizeQueryBuffer(redisClient *c) {
     return 0;
 }
 
+#define CLIENTS_CRON_MIN_ITERATIONS 5
 void clientsCron(void) {
-    /* Make sure to process at least 1/(server.hz*10) of clients per call.
-     * Since this function is called server.hz times per second we are sure that
-     * in the worst case we process all the clients in 10 seconds.
-     * In normal conditions (a reasonable number of clients) we process
-     * all the clients in a shorter time. */
+    /* Make sure to process at least numclients/server.hz of clients
+     * per call. Since this function is called server.hz times per second
+     * we are sure that in the worst case we process all the clients in 1
+     * second. */
     int numclients = listLength(server.clients);
-    int iterations = numclients/(server.hz*10);
+    int iterations = numclients/server.hz;
+    mstime_t now = mstime();
 
-    if (iterations < 50)
-        iterations = (numclients < 50) ? numclients : 50;
+    /* Process at least a few clients while we are at it, even if we need
+     * to process less than CLIENTS_CRON_MIN_ITERATIONS to meet our contract
+     * of processing each client once per second. */
+    if (iterations < CLIENTS_CRON_MIN_ITERATIONS)
+        iterations = (numclients < CLIENTS_CRON_MIN_ITERATIONS) ?
+                     numclients : CLIENTS_CRON_MIN_ITERATIONS;
+
     while(listLength(server.clients) && iterations--) {
         redisClient *c;
         listNode *head;
@@ -980,7 +998,7 @@ void clientsCron(void) {
         /* The following functions do different service checks on the client.
          * The protocol is that they return non-zero if the client was
          * terminated. */
-        if (clientsCronHandleTimeout(c)) continue;
+        if (clientsCronHandleTimeout(c,now)) continue;
         if (clientsCronResizeQueryBuffer(c)) continue;
     }
 }
@@ -1158,7 +1176,13 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
 
             if (WIFSIGNALED(statloc)) bysignal = WTERMSIG(statloc);
 
-            if (pid == server.rdb_child_pid) {
+            if (pid == -1) {
+                redisLog(LOG_WARNING,"wait3() returned an error: %s. "
+                    "rdb_child_pid = %d, aof_child_pid = %d",
+                    strerror(errno),
+                    (int) server.rdb_child_pid,
+                    (int) server.aof_child_pid);
+            } else if (pid == server.rdb_child_pid) {
                 backgroundSaveDoneHandler(exitcode,bysignal);
             } else if (pid == server.aof_child_pid) {
                 backgroundRewriteDoneHandler(exitcode,bysignal);
@@ -1257,6 +1281,12 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
 void beforeSleep(struct aeEventLoop *eventLoop) {
     REDIS_NOTUSED(eventLoop);
 
+    /* Call the Redis Cluster before sleep function. Note that this function
+     * may change the state of Redis Cluster (from ok to fail or vice versa),
+     * so it's a good idea to call it before serving the unblocked clients
+     * later in this function. */
+    if (server.cluster_enabled) clusterBeforeSleep();
+
     /* Run a fast expire cycle (the called function will return
      * ASAP if a fast cycle is not needed). */
     if (server.active_expire_enabled && server.masterhost == NULL)
@@ -1288,9 +1318,6 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
 
     /* Write the AOF buffer on disk */
     flushAppendOnlyFile(0);
-
-    /* Call the Redis Cluster before sleep function. */
-    if (server.cluster_enabled) clusterBeforeSleep();
 }
 
 /* =========================== Server initialization ======================== */
@@ -1671,17 +1698,19 @@ int listenToPort(int port, int *fds, int *count) {
             if (fds[*count] != ANET_ERR) {
                 anetNonBlock(NULL,fds[*count]);
                 (*count)++;
+
+                /* Bind the IPv4 address as well. */
+                fds[*count] = anetTcpServer(server.neterr,port,NULL,
+                    server.tcp_backlog);
+                if (fds[*count] != ANET_ERR) {
+                    anetNonBlock(NULL,fds[*count]);
+                    (*count)++;
+                }
             }
-            fds[*count] = anetTcpServer(server.neterr,port,NULL,
-                server.tcp_backlog);
-            if (fds[*count] != ANET_ERR) {
-                anetNonBlock(NULL,fds[*count]);
-                (*count)++;
-            }
-            /* Exit the loop if we were able to bind * on IPv4 or IPv6,
+            /* Exit the loop if we were able to bind * on IPv4 and IPv6,
              * otherwise fds[*count] will be ANET_ERR and we'll print an
              * error and return to the caller with an error. */
-            if (*count) break;
+            if (*count == 2) break;
         } else if (strchr(server.bindaddr[j],':')) {
             /* Bind IPv6 address. */
             fds[*count] = anetTcp6Server(server.neterr,port,server.bindaddr[j],
@@ -1731,6 +1760,7 @@ void resetServerStats(void) {
     }
     server.stat_net_input_bytes = 0;
     server.stat_net_output_bytes = 0;
+    server.aof_delayed_fsync = 0;
 }
 
 void initServer(void) {
@@ -1774,7 +1804,7 @@ void initServer(void) {
         server.sofd = anetUnixServer(server.neterr,server.unixsocket,
             server.unixsocketperm, server.tcp_backlog);
         if (server.sofd == ANET_ERR) {
-            redisLog(REDIS_WARNING, "Opening socket: %s", server.neterr);
+            redisLog(REDIS_WARNING, "Opening Unix socket: %s", server.neterr);
             exit(1);
         }
         anetNonBlock(NULL,server.sofd);
@@ -2155,38 +2185,23 @@ int processCommand(redisClient *c) {
      * 2) The command has no key arguments. */
     if (server.cluster_enabled &&
         !(c->flags & REDIS_MASTER) &&
-        !(c->cmd->getkeys_proc == NULL && c->cmd->firstkey == 0))
+        !(c->flags & REDIS_LUA_CLIENT &&
+          server.lua_caller->flags & REDIS_MASTER) &&
+        !(c->cmd->getkeys_proc == NULL && c->cmd->firstkey == 0 &&
+          c->cmd->proc != execCommand))
     {
         int hashslot;
-
-        if (server.cluster->state != REDIS_CLUSTER_OK) {
-            flagTransaction(c);
-            addReplySds(c,sdsnew("-CLUSTERDOWN The cluster is down. Use CLUSTER INFO for more information\r\n"));
-            return REDIS_OK;
-        } else {
-            int error_code;
-            clusterNode *n = getNodeByQuery(c,c->cmd,c->argv,c->argc,&hashslot,&error_code);
-            if (n == NULL) {
+        int error_code;
+        clusterNode *n = getNodeByQuery(c,c->cmd,c->argv,c->argc,
+                                        &hashslot,&error_code);
+        if (n == NULL || n != server.cluster->myself) {
+            if (c->cmd->proc == execCommand) {
+                discardTransaction(c);
+            } else {
                 flagTransaction(c);
-                if (error_code == REDIS_CLUSTER_REDIR_CROSS_SLOT) {
-                    addReplySds(c,sdsnew("-CROSSSLOT Keys in request don't hash to the same slot\r\n"));
-                } else if (error_code == REDIS_CLUSTER_REDIR_UNSTABLE) {
-                    /* The request spawns mutliple keys in the same slot,
-                     * but the slot is not "stable" currently as there is
-                     * a migration or import in progress. */
-                    addReplySds(c,sdsnew("-TRYAGAIN Multiple keys request during rehashing of slot\r\n"));
-                } else {
-                    redisPanic("getNodeByQuery() unknown error.");
-                }
-                return REDIS_OK;
-            } else if (n != server.cluster->myself) {
-                flagTransaction(c);
-                addReplySds(c,sdscatprintf(sdsempty(),
-                    "-%s %d %s:%d\r\n",
-                    (error_code == REDIS_CLUSTER_REDIR_ASK) ? "ASK" : "MOVED",
-                    hashslot,n->ip,n->port));
-                return REDIS_OK;
             }
+            clusterRedirectClient(c,n,hashslot,error_code);
+            return REDIS_OK;
         }
     }
 
@@ -2197,6 +2212,12 @@ int processCommand(redisClient *c) {
      * is returning an error. */
     if (server.maxmemory) {
         int retval = freeMemoryIfNeeded();
+        /* freeMemoryIfNeeded may flush slave output buffers. This may result
+         * into a slave, that may be the active client, to be freed. */
+        if (server.current_client == NULL) return REDIS_ERR;
+
+        /* It was impossible to free enough memory, and the command the client
+         * is trying to execute is denied during OOM conditions? Error. */
         if ((c->cmd->flags & REDIS_CMD_DENYOOM) && retval == REDIS_ERR) {
             flagTransaction(c);
             addReply(c, shared.oomerr);
@@ -2255,7 +2276,7 @@ int processCommand(redisClient *c) {
         c->cmd->proc != unsubscribeCommand &&
         c->cmd->proc != psubscribeCommand &&
         c->cmd->proc != punsubscribeCommand) {
-        addReplyError(c,"only (P)SUBSCRIBE / (P)UNSUBSCRIBE / QUIT allowed in this context");
+        addReplyError(c,"only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT allowed in this context");
         return REDIS_OK;
     }
 
@@ -3136,13 +3157,7 @@ void evictionPoolPopulate(dict *sampledict, dict *keydict, struct evictionPoolEn
         samples = zmalloc(sizeof(samples[0])*server.maxmemory_samples);
     }
 
-#if 1 /* Use bulk get by default. */
-    count = dictGetRandomKeys(sampledict,samples,server.maxmemory_samples);
-#else
-    count = server.maxmemory_samples;
-    for (j = 0; j < count; j++) samples[j] = dictGetRandomKey(sampledict);
-#endif
-
+    count = dictGetSomeKeys(sampledict,samples,server.maxmemory_samples);
     for (j = 0; j < count; j++) {
         unsigned long long idle;
         sds key;
@@ -3197,7 +3212,7 @@ void evictionPoolPopulate(dict *sampledict, dict *keydict, struct evictionPoolEn
 int freeMemoryIfNeeded(void) {
     size_t mem_used, mem_tofree, mem_freed;
     int slaves = listLength(server.slaves);
-    mstime_t latency;
+    mstime_t latency, eviction_latency;
 
     /* Remove the size of slaves output buffers and AOF buffer from the
      * count of used memory. */
@@ -3328,7 +3343,11 @@ int freeMemoryIfNeeded(void) {
                  * AOF and Output buffer memory will be freed eventually so
                  * we only care about memory used by the key space. */
                 delta = (long long) zmalloc_used_memory();
+                latencyStartMonitor(eviction_latency);
                 dbDelete(db,keyobj);
+                latencyEndMonitor(eviction_latency);
+                latencyAddSampleIfNeeded("eviction-del",eviction_latency);
+                latencyRemoveNestedEvent(latency,eviction_latency);
                 delta -= (long long) zmalloc_used_memory();
                 mem_freed += delta;
                 server.stat_evictedkeys++;
@@ -3658,6 +3677,7 @@ int main(int argc, char **argv) {
     if (server.daemonize) createPidFile();
     redisSetProcTitle(argv[0]);
     redisAsciiArt();
+    checkTcpBacklogSettings();
 
     if (!server.sentinel_mode) {
         /* Things not needed when running in Sentinel mode. */
@@ -3665,7 +3685,6 @@ int main(int argc, char **argv) {
     #ifdef __linux__
         linuxMemoryWarnings();
     #endif
-        checkTcpBacklogSettings();
         loadDataFromDisk();
         if (server.cluster_enabled) {
             if (verifyClusterConfigWithData() == REDIS_ERR) {
